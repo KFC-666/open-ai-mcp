@@ -104,10 +104,11 @@ async function saveToGitHub(
   b64List: string[],
   meta: { prompt: string; model: string; kind: "generate" | "edit"; urls: string[]; size?: string },
 ): Promise<string> {
-  const token = process.env.GITHUB_TOKEN;
-  const repo = process.env.GITHUB_PHOTO_REPO;
+  // Names are case-sensitive; accept the lowercase spellings too.
+  const token = process.env.GITHUB_TOKEN || process.env.github_token;
+  const repo = process.env.GITHUB_PHOTO_REPO || process.env.github_photo_repo;
   if (!token || !repo) return "";
-  const branch = process.env.GITHUB_PHOTO_BRANCH || "main";
+  const branch = process.env.GITHUB_PHOTO_BRANCH || process.env.github_photo_branch || "main";
   const api = async (method: string, path: string, body?: unknown) => {
     const res = await fetch(`https://api.github.com/repos/${repo}/${path}`, {
       method,
