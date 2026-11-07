@@ -102,7 +102,16 @@ async function hostImages(b64List: string[], prompt: string): Promise<string[]> 
  */
 async function saveToGitHub(
   b64List: string[],
-  meta: { prompt: string; model: string; kind: "generate" | "edit"; urls: string[]; size?: string },
+  meta: {
+    prompt: string;
+    model: string;
+    kind: "generate" | "edit" | "save";
+    urls: string[];
+    size?: string;
+    ext?: string; // file extension without dot, default "png"
+    source?: string; // where a saved image came from, e.g. "Hugging Face Z-Image"
+    note?: string;
+  },
 ): Promise<string> {
   // Names are case-sensitive; accept the lowercase spellings too.
   const token = process.env.GITHUB_TOKEN || process.env.github_token;
@@ -136,11 +145,20 @@ async function saveToGitHub(
     b64List.forEach((b64, i) => {
       const id = `${stamp}-${Math.random().toString(36).slice(2, 6)}${b64List.length > 1 ? `-${i + 1}` : ""}`;
       const base = `photos/${month}/${id}`;
-      files.push({ path: `${base}.png`, content: b64, encoding: "base64" });
+      files.push({ path: `${base}.${meta.ext ?? "png"}`, content: b64, encoding: "base64" });
       files.push({
         path: `${base}.json`,
         content: JSON.stringify(
-          { prompt: meta.prompt, model: meta.model, kind: meta.kind, size: meta.size ?? null, time, url: meta.urls[i] ?? null },
+          {
+            prompt: meta.prompt,
+            model: meta.model,
+            kind: meta.kind,
+            size: meta.size ?? null,
+            time,
+            url: meta.urls[i] ?? null,
+            ...(meta.source ? { source: meta.source } : {}),
+            ...(meta.note ? { note: meta.note } : {}),
+          },
           null,
           1,
         ),
@@ -157,7 +175,7 @@ async function saveToGitHub(
       const parentCommit = await api("GET", `git/commits/${parent}`);
       const newTree = await api("POST", "git/trees", { base_tree: parentCommit.tree.sha, tree });
       const commit = await api("POST", "git/commits", {
-        message: `${meta.kind === "edit" ? "改圖" : "生圖"}：${meta.prompt.slice(0, 60)}`,
+        message: `${{ edit: "改圖", save: "存圖", generate: "生圖" }[meta.kind]}：${(meta.prompt || meta.note || meta.source || "").slice(0, 60)}`,
         tree: newTree.sha,
         parents: [parent],
       });
@@ -332,6 +350,49 @@ const handler = createMcpHandler((server) => {
         const urls = await hostImages(images, prompt);
         const note = await saveToGitHub(images, { prompt, model: chosen, kind: "edit", urls, size });
         return ok(urls, images, chosen, !!include_base64, note);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+  server.tool(
+    "save_to_album",
+    "Save an existing image (given by a public URL — e.g. one made by another tool such as a Hugging Face Space) " +
+      "into the user's private GitHub photo album. Use when the user asks to keep / save / 存 an image that was not " +
+      "made by generate_image or edit_image (those are saved automatically). Accepts PNG, JPEG or WebP.",
+    {
+      image_url: z.string().url().describe("Public URL of the image to save."),
+      prompt: z.string().optional().describe("The prompt that produced the image, if known."),
+      source: z.string().optional().describe("Where the image came from, e.g. 'Hugging Face Z-Image Turbo'."),
+      note: z.string().optional().describe("Optional caption."),
+    },
+    async ({ image_url, prompt, source, note }) => {
+      try {
+        if (!(process.env.GITHUB_TOKEN || process.env.github_token) || !(process.env.GITHUB_PHOTO_REPO || process.env.github_photo_repo)) {
+          throw new Error("The GitHub album is not configured on the server (GITHUB_TOKEN / GITHUB_PHOTO_REPO).");
+        }
+        const res = await fetch(image_url);
+        if (!res.ok) throw new Error(`Could not download the image: HTTP ${res.status}`);
+        const type = (res.headers.get("content-type") || "").split(";")[0].trim();
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > 20 * 1024 * 1024) throw new Error("Image is larger than 20 MB.");
+        const sig = buf.subarray(0, 12).toString("hex");
+        const ext = sig.startsWith("89504e47") ? "png"
+          : sig.startsWith("ffd8ff") ? "jpg"
+          : sig.startsWith("52494646") && buf.subarray(8, 12).toString() === "WEBP" ? "webp"
+          : type === "image/png" ? "png" : type === "image/jpeg" ? "jpg" : type === "image/webp" ? "webp" : "";
+        if (!ext) throw new Error(`Not a PNG/JPEG/WebP image (content-type: ${type || "unknown"}).`);
+        const note2 = await saveToGitHub([buf.toString("base64")], {
+          prompt: prompt ?? "",
+          model: "",
+          kind: "save",
+          urls: [image_url],
+          ext,
+          source,
+          note,
+        });
+        if (!note2.startsWith("Saved")) throw new Error(note2 || "Save failed.");
+        return { content: [{ type: "text" as const, text: note2 }] };
       } catch (err) {
         return fail(err);
       }
