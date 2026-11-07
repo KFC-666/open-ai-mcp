@@ -91,15 +91,104 @@ async function hostImages(b64List: string[], prompt: string): Promise<string[]> 
   return urls;
 }
 
+/**
+ * Optional: also keep a copy of every image in a private GitHub repo (a photo album).
+ * Enabled only when both env vars are set:
+ *   GITHUB_TOKEN       fine-grained token with Contents: read & write on that repo only
+ *   GITHUB_PHOTO_REPO  "owner/repo", e.g. "KFC-666/zhanzhan-photos"
+ *   GITHUB_PHOTO_BRANCH  optional, default "main"
+ * Each call becomes ONE commit: photos/YYYY-MM/<stamp>-<id>.png plus a .json with the prompt.
+ * Failures never break image generation; they only add a note to the reply.
+ */
+async function saveToGitHub(
+  b64List: string[],
+  meta: { prompt: string; model: string; kind: "generate" | "edit"; urls: string[]; size?: string },
+): Promise<string> {
+  const token = process.env.GITHUB_TOKEN;
+  const repo = process.env.GITHUB_PHOTO_REPO;
+  if (!token || !repo) return "";
+  const branch = process.env.GITHUB_PHOTO_BRANCH || "main";
+  const api = async (method: string, path: string, body?: unknown) => {
+    const res = await fetch(`https://api.github.com/repos/${repo}/${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const json = (await res.json().catch(() => ({}))) as Record<string, any>;
+    if (!res.ok) throw Object.assign(new Error(`GitHub ${res.status} ${json?.message ?? ""}`), { status: res.status });
+    return json;
+  };
+
+  // Taiwan time for folder / file names
+  const tw = new Date(Date.now() + 8 * 3600e3).toISOString(); // 2026-11-07T20:15:30.123Z (shifted)
+  const month = tw.slice(0, 7);
+  const stamp = tw.slice(0, 19).replace(/[-:]/g, "").replace("T", "-"); // 20261107-201530
+  const time = new Date().toISOString();
+
+  const work = async () => {
+    const files: { path: string; content: string; encoding: "base64" | "utf-8" }[] = [];
+    b64List.forEach((b64, i) => {
+      const id = `${stamp}-${Math.random().toString(36).slice(2, 6)}${b64List.length > 1 ? `-${i + 1}` : ""}`;
+      const base = `photos/${month}/${id}`;
+      files.push({ path: `${base}.png`, content: b64, encoding: "base64" });
+      files.push({
+        path: `${base}.json`,
+        content: JSON.stringify(
+          { prompt: meta.prompt, model: meta.model, kind: meta.kind, size: meta.size ?? null, time, url: meta.urls[i] ?? null },
+          null,
+          1,
+        ),
+        encoding: "utf-8",
+      });
+    });
+    const blobs = await Promise.all(
+      files.map((f) => api("POST", "git/blobs", { content: f.content, encoding: f.encoding })),
+    );
+    const tree = files.map((f, i) => ({ path: f.path, mode: "100644", type: "blob", sha: blobs[i].sha }));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const ref = await api("GET", `git/ref/heads/${encodeURIComponent(branch)}`);
+      const parent = ref.object.sha as string;
+      const parentCommit = await api("GET", `git/commits/${parent}`);
+      const newTree = await api("POST", "git/trees", { base_tree: parentCommit.tree.sha, tree });
+      const commit = await api("POST", "git/commits", {
+        message: `${meta.kind === "edit" ? "改圖" : "生圖"}：${meta.prompt.slice(0, 60)}`,
+        tree: newTree.sha,
+        parents: [parent],
+      });
+      try {
+        await api("PATCH", `git/refs/heads/${encodeURIComponent(branch)}`, { sha: commit.sha });
+        return `Saved a copy to the GitHub album (${repo}/photos/${month}/).`;
+      } catch (e: any) {
+        if (e?.status !== 422 || attempt === 2) throw e; // 422 = someone else committed first; retry
+      }
+    }
+    return "";
+  };
+
+  try {
+    return await Promise.race([
+      work(),
+      new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timed out")), 20000)),
+    ]);
+  } catch (e) {
+    return `(Album copy to GitHub failed: ${e instanceof Error ? e.message : String(e)}. The image itself is fine.)`;
+  }
+}
+
 type Content =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
-function ok(urls: string[], b64List: string[], modelUsed: string, includeB64: boolean) {
+function ok(urls: string[], b64List: string[], modelUsed: string, includeB64: boolean, note = "") {
   const header =
-    urls.length === 1
+    (urls.length === 1
       ? `Image generated with ${modelUsed}. Public URL (embed in <img src> / markdown):\n${urls[0]}`
-      : `Images generated with ${modelUsed}. Public URLs:\n${urls.join("\n")}`;
+      : `Images generated with ${modelUsed}. Public URLs:\n${urls.join("\n")}`) + (note ? `\n${note}` : "");
 
   const content: Content[] = [
     { type: "text", text: header },
@@ -184,7 +273,9 @@ const handler = createMcpHandler((server) => {
         if (!res.ok) throw new Error(json?.error?.message ?? `HTTP ${res.status}`);
 
         const images = await extractImages(json);
-        return ok(await hostImages(images, prompt), images, chosen, !!include_base64);
+        const urls = await hostImages(images, prompt);
+        const note = await saveToGitHub(images, { prompt, model: chosen, kind: "generate", urls, size });
+        return ok(urls, images, chosen, !!include_base64, note);
       } catch (err) {
         return fail(err);
       }
@@ -237,7 +328,9 @@ const handler = createMcpHandler((server) => {
         if (!res.ok) throw new Error(json?.error?.message ?? `HTTP ${res.status}`);
 
         const images = await extractImages(json);
-        return ok(await hostImages(images, prompt), images, chosen, !!include_base64);
+        const urls = await hostImages(images, prompt);
+        const note = await saveToGitHub(images, { prompt, model: chosen, kind: "edit", urls, size });
+        return ok(urls, images, chosen, !!include_base64, note);
       } catch (err) {
         return fail(err);
       }
