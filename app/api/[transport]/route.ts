@@ -19,36 +19,20 @@ import { z } from "zod";
  *   MCP_SECRET              a long random string you invent
  *   BLOB_READ_WRITE_TOKEN   auto-added when you enable Vercel Blob on the project
  * Optional:
- *   OPENAI_IMAGE_MODEL      default "gpt-image-1.5"
+ *   OPENAI_IMAGE_MODEL      default "gpt-image-2.5-sunburst"
  */
 
 const API_BASE = "https://api.openai.com/v1";
 
-// Non-flagship default (cheaper/faster). Overridable via env.
-const DEFAULT_MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1.5";
+// The model used unless the caller names another one. Overridable via env.
+const DEFAULT_MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-2.5-sunburst";
 
-// Bengali/Bangla script renders far better on gpt-image-2. Detect by numeric
-// codepoint (U+0980–U+09FF) — no regex literal, so it survives minification.
-function hasBengali(text: string): boolean {
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    if (c >= 0x0980 && c <= 0x09ff) return true;
-  }
-  return false;
-}
+// Models a caller may name. "auto" means DEFAULT_MODEL.
+const MODEL_CHOICES = ["auto", "gpt-image-2.5-sunburst", "gpt-image-2", "gpt-image-1.5"] as const;
 
-/**
- * Intelligent model rotation.
- *  - An explicit model always wins.
- *  - Prompt contains Bengali text -> gpt-image-2 (best at that script).
- *  - "auto" + quality=high -> flagship gpt-image-2 for final renders.
- *  - Otherwise the cheaper/faster DEFAULT_MODEL (gpt-image-1.5).
- */
-function pickModel(model: string | undefined, quality: string | undefined, prompt: string): string {
-  if (model && model !== "auto") return model;
-  if (hasBengali(prompt)) return "gpt-image-2";
-  if (quality === "high") return "gpt-image-2";
-  return DEFAULT_MODEL;
+/** DEFAULT_MODEL at every size and quality; another model only when the caller names it. */
+function pickModel(model: string | undefined): string {
+  return model && model !== "auto" ? model : DEFAULT_MODEL;
 }
 
 // Image generation can take a while; give the function room (seconds).
@@ -242,11 +226,12 @@ const handler = createMcpHandler((server) => {
   server.tool(
     "generate_image",
     "Generate an image from a text prompt using OpenAI, host it, and return a PUBLIC URL you can embed " +
-      "directly in HTML pages, slides, or markdown. Write a detailed prompt — subject, style, lighting, composition. " +
-      "Model: leave 'auto' (gpt-image-1.5 for most work; gpt-image-2 auto-selected for Bengali text or quality=high) or set it. " +
-      "gpt-image-2 handles Bengali/Bangla text well, so prefer it when the image must render Bangla words. " +
-      "Match size and quality to the NEED — do NOT default to high quality or large sizes. Use 1024x1024 + low/medium for " +
-      "drafts, icons, thumbnails, simple graphics; reserve high quality and 1536-wide/tall sizes for detailed hero/print art. " +
+      "directly in HTML pages, slides, or markdown. The image is also saved to the user's GitHub photo album when the " +
+      "server has one configured. Write a detailed prompt: subject, style, lighting, composition. " +
+      `Model: ${DEFAULT_MODEL} at every size and quality. Set 'model' only when the user asks for a different one. ` +
+      "Cost and generation time rise with size and quality: 1024x1024 at low or medium suits drafts, icons, thumbnails " +
+      "and simple graphics; the 1536 sizes and high quality suit detailed hero or print art. High quality can take over " +
+      "a minute, which some clients cut off. " +
       "If a sandbox gets a 403 fetching the returned URL, pass include_base64=true and decode the base64 to a file.",
     {
       prompt: z.string().describe("Detailed description of the image to generate."),
@@ -260,11 +245,11 @@ const handler = createMcpHandler((server) => {
         .describe("Cost scales with quality. Use low/medium by default; only use high when detail genuinely matters."),
       n: z.number().int().min(1).max(4).optional().describe("How many variations (default 1)."),
       model: z
-        .enum(["auto", "gpt-image-1.5", "gpt-image-2"])
+        .enum(MODEL_CHOICES)
         .optional()
         .describe(
-          "Which OpenAI image model. 'auto' (default) uses gpt-image-2 when quality=high, else gpt-image-1.5. " +
-            "Pick gpt-image-2 for final/hero art, gpt-image-1.5 for drafts and iteration.",
+          `Which OpenAI image model. Omit it or pass 'auto' to use ${DEFAULT_MODEL}. Name another model only when ` +
+            "the user asks for it.",
         ),
       include_base64: z
         .boolean()
@@ -278,7 +263,7 @@ const handler = createMcpHandler((server) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
-        const chosen = pickModel(model, quality, prompt);
+        const chosen = pickModel(model);
         const body: Record<string, unknown> = { model: chosen, prompt, n: n ?? 1 };
         if (size) body.size = size;
         if (quality) body.quality = quality;
@@ -303,18 +288,27 @@ const handler = createMcpHandler((server) => {
 
   server.tool(
     "edit_image",
-    "Edit or extend an existing image (given by its public URL) using a text instruction, host the result, " +
-      "and return a new PUBLIC URL. Optionally supply a mask URL (transparent pixels mark the region to change).",
+    "Edit or extend an existing image, given by its public URL, following a text instruction. Hosts the result and " +
+      "returns a new public URL; the result is also saved to the user's GitHub photo album when the server has one " +
+      "configured. The server downloads the source, so the URL must be reachable without sign-in. Optionally supply a " +
+      "mask URL: a PNG with the same dimensions as the source whose transparent pixels mark the region to change; " +
+      "without a mask the whole image may be redrawn. Model, size and quality work as in generate_image.",
     {
       image_url: z.string().url().describe("Public URL of the source image to edit."),
       prompt: z.string().describe("What to change."),
       mask_url: z.string().url().optional().describe("Public URL of an optional PNG mask."),
-      size: z.enum(["1024x1024", "1024x1536", "1536x1024", "auto"]).optional(),
-      quality: z.enum(["low", "medium", "high", "auto"]).optional(),
-      model: z
-        .enum(["auto", "gpt-image-1.5", "gpt-image-2"])
+      size: z
+        .enum(["1024x1024", "1024x1536", "1536x1024", "auto"])
         .optional()
-        .describe("Which model. 'auto' (default): gpt-image-2 when quality=high, else gpt-image-1.5."),
+        .describe("Output size: square, portrait or landscape. Omit to let the image model choose."),
+      quality: z
+        .enum(["low", "medium", "high", "auto"])
+        .optional()
+        .describe("Cost and time rise with quality; high can take over a minute."),
+      model: z
+        .enum(MODEL_CHOICES)
+        .optional()
+        .describe(`Omit it or pass 'auto' to use ${DEFAULT_MODEL}. Name another model only when the user asks for it.`),
       include_base64: z
         .boolean()
         .optional()
@@ -324,7 +318,7 @@ const handler = createMcpHandler((server) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
-        const chosen = pickModel(model, quality, prompt);
+        const chosen = pickModel(model);
 
         const imgBuf = Buffer.from(await (await fetch(image_url)).arrayBuffer());
         const form = new FormData();

@@ -12,10 +12,14 @@ cloud because Claude's servers can reach it over HTTPS.
 
 ## What you get
 
-Two tools:
+Three tools:
 
-- `generate_image(prompt, size?, quality?, n?)` → returns a public PNG URL (+ inline preview)
-- `edit_image(image_url, prompt, mask_url?, size?, quality?)` → edits an image by URL, returns a new URL
+- `generate_image(prompt, size?, quality?, n?, model?, include_base64?)` → returns a public PNG URL (+ inline preview)
+- `edit_image(image_url, prompt, mask_url?, size?, quality?, model?, include_base64?)` → edits an image by URL, returns a new URL
+- `save_to_album(image_url, prompt?, source?, note?)` → saves any image URL into the GitHub photo album
+
+Images are generated with `gpt-image-2.5-sunburst` (or `OPENAI_IMAGE_MODEL`) unless a call names another model.
+When `GITHUB_TOKEN` and `GITHUB_PHOTO_REPO` are set, every generated or edited image is also committed to that repo.
 
 Images are returned as **URLs** (not local files) so Claude can drop them straight into `<img src>`.
 
@@ -28,7 +32,7 @@ You run these — they need your Vercel + OpenAI login.
 ### 1. Install deps
 
 ```bash
-cd C:\Users\ramim\openai-image-remote-mcp
+cd open-ai-mcp
 npm install
 ```
 
@@ -89,7 +93,7 @@ Keep this URL private — anyone who has it can spend your OpenAI credits.
 
 1. https://claude.ai → **Settings** → **Connectors** → **Add custom connector**.
 2. Paste the connector URL above.
-3. Save. Claude will connect and list `generate_image` + `edit_image`.
+3. Save. Claude will connect and list `generate_image`, `edit_image` and `save_to_album`.
 4. In a chat / Design, say: *"use the openai-image connector to generate ..."*.
 
 If claude.ai insists on OAuth and refuses the URL, tell Claude Code — the code is structured so an
@@ -107,7 +111,7 @@ npx @modelcontextprotocol/inspector
 # url: https://YOUR-PROJECT.vercel.app/api/mcp?k=<secret>
 ```
 
-You should see the two tools and be able to call `generate_image`.
+You should see the three tools and be able to call `generate_image`.
 
 ---
 
