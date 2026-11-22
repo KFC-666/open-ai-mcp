@@ -12,11 +12,16 @@ cloud because Claude's servers can reach it over HTTPS.
 
 ## What you get
 
-Three tools:
+Four tools:
 
 - `generate_image(prompt, size?, quality?, n?, model?, include_base64?)` → returns a public PNG URL (+ inline preview)
-- `edit_image(image_url, prompt, mask_url?, size?, quality?, model?, include_base64?)` → edits an image by URL, returns a new URL
+- `edit_image(image_url, prompt, reference_images?, mask_url?, size?, quality?, model?, include_base64?)` → edits an image, returns a new URL.
+  `image_url`, `reference_images` (up to 15 more) and `mask_url` each take a public URL **or a photo in the private
+  GitHub album**: an album path (`photos/2026-11/20261122-212839-hn42.png`), a bare id (`20261122-212839-hn42`), or a
+  github.com / raw.githubusercontent.com link. The server reads the album with `GITHUB_TOKEN`. A GIF uses its first frame.
 - `save_to_album(image_url, prompt?, source?, note?)` → saves any image URL into the GitHub photo album
+- `list_album(album?, month?, query?, limit?, preview?)` → lists album photos (newest first) with their album groups
+  from `albums.json` and the start of their prompt, to find paths for `edit_image`; `preview` adds 512px thumbnails
 
 Images are generated with `gpt-image-2.5-sunburst` (or `OPENAI_IMAGE_MODEL`) unless a call names another model.
 When `GITHUB_TOKEN` and `GITHUB_PHOTO_REPO` are set, every generated or edited image is also committed to that repo.
@@ -93,7 +98,7 @@ Keep this URL private — anyone who has it can spend your OpenAI credits.
 
 1. https://claude.ai → **Settings** → **Connectors** → **Add custom connector**.
 2. Paste the connector URL above.
-3. Save. Claude will connect and list `generate_image`, `edit_image` and `save_to_album`.
+3. Save. Claude will connect and list `generate_image`, `edit_image`, `save_to_album` and `list_album`.
 4. In a chat / Design, say: *"use the openai-image connector to generate ..."*.
 
 If claude.ai insists on OAuth and refuses the URL, tell Claude Code — the code is structured so an
@@ -111,7 +116,7 @@ npx @modelcontextprotocol/inspector
 # url: https://YOUR-PROJECT.vercel.app/api/mcp?k=<secret>
 ```
 
-You should see the three tools and be able to call `generate_image`.
+You should see the four tools and be able to call `generate_image`.
 
 ---
 
