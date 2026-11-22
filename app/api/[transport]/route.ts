@@ -1,6 +1,7 @@
 import { createMcpHandler } from "mcp-handler";
 import { put } from "@vercel/blob";
 import { z } from "zod";
+import sharp from "sharp";
 
 /**
  * Remote MCP server for image generation.
@@ -75,6 +76,128 @@ async function hostImages(b64List: string[], prompt: string): Promise<string[]> 
   return urls;
 }
 
+/** GitHub album settings, or null when not configured. Names are case-sensitive; accept lowercase too. */
+function albumConfig(): { token: string; repo: string; branch: string } | null {
+  const token = process.env.GITHUB_TOKEN || process.env.github_token;
+  const repo = process.env.GITHUB_PHOTO_REPO || process.env.github_photo_repo;
+  if (!token || !repo) return null;
+  const branch = process.env.GITHUB_PHOTO_BRANCH || process.env.github_photo_branch || "main";
+  return { token, repo, branch };
+}
+
+/** Raw GET against the album repo's contents API (works for a private repo). */
+async function albumGet(path: string, raw = true): Promise<Response> {
+  const cfg = albumConfig();
+  if (!cfg) throw new Error("The GitHub album is not configured on the server (GITHUB_TOKEN / GITHUB_PHOTO_REPO).");
+  const enc = path.split("/").map(encodeURIComponent).join("/");
+  return fetch(`https://api.github.com/repos/${cfg.repo}/contents/${enc}?ref=${encodeURIComponent(cfg.branch)}`, {
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      Accept: raw ? "application/vnd.github.raw" : "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+    cache: "no-store",
+  });
+}
+
+const IMG_EXT = /\.(png|jpe?g|webp|gif)$/i;
+
+/** Sniff the real image type from the first bytes. */
+function sniff(buf: Buffer): { mime: string; ext: string } | null {
+  const sig = buf.subarray(0, 12).toString("hex");
+  if (sig.startsWith("89504e47")) return { mime: "image/png", ext: "png" };
+  if (sig.startsWith("ffd8ff")) return { mime: "image/jpeg", ext: "jpg" };
+  if (sig.startsWith("52494646") && buf.subarray(8, 12).toString() === "WEBP") return { mime: "image/webp", ext: "webp" };
+  if (sig.startsWith("47494638")) return { mime: "image/gif", ext: "gif" };
+  return null;
+}
+
+/**
+ * If `ref` points into the album, return its repo path ("photos/2026-11/x.png" or an id without extension).
+ * Accepts: an album path, a bare file name or id ("20261122-212839-hn42[.png]"),
+ * or a github.com/…/blob/… or raw.githubusercontent.com URL of the album repo.
+ */
+function albumPathOf(ref: string): string | null {
+  const s = ref.trim().replace(/^album:/i, "");
+  if (!/^https?:\/\//i.test(s)) {
+    const p = s.replace(/^\/+/, "");
+    if (p.startsWith("photos/")) return p;
+    if (/^\d{8}-\d{6}-[a-z0-9-]+(\.\w+)?$/i.test(p)) return p; // bare id / file name
+    return null;
+  }
+  const cfg = albumConfig();
+  if (!cfg) return null;
+  const u = new URL(s);
+  const repo = cfg.repo.toLowerCase();
+  const parts = u.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  if (u.hostname === "github.com" && `${parts[0]}/${parts[1]}`.toLowerCase() === repo && ["blob", "raw"].includes(parts[2])) {
+    return parts.slice(4).join("/");
+  }
+  if (u.hostname === "raw.githubusercontent.com" && `${parts[0]}/${parts[1]}`.toLowerCase() === repo) {
+    return parts.slice(3).join("/");
+  }
+  return null;
+}
+
+/** "20261122-212839-hn42" or "20261122-212839-hn42.png" -> "photos/2026-11/20261122-212839-hn42.png" */
+async function completeAlbumPath(p: string): Promise<string> {
+  if (p.includes("/") && IMG_EXT.test(p)) return p;
+  const name = p.split("/").pop()!;
+  const m = name.match(/^(\d{4})(\d{2})\d{2}-/);
+  const dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : m ? `photos/${m[1]}-${m[2]}` : "";
+  if (!dir) throw new Error(`Can't tell which album folder "${p}" is in. Use a path like photos/2026-11/<file>.png.`);
+  if (IMG_EXT.test(name)) return `${dir}/${name}`;
+  const res = await albumGet(dir, false);
+  if (!res.ok) throw new Error(`Album folder ${dir} not found (GitHub ${res.status}).`);
+  const list = (await res.json()) as Array<{ name: string }>;
+  const hit = list.find((f) => f.name.replace(IMG_EXT, "") === name && IMG_EXT.test(f.name));
+  if (!hit) throw new Error(`No photo named ${name} in ${dir}.`);
+  return `${dir}/${hit.name}`;
+}
+
+type SourceImage = { buf: Buffer; mime: string; ext: string; label: string };
+
+/** Download an image from the album (private repo, via the token) or from any public URL. */
+async function loadImage(ref: string): Promise<SourceImage> {
+  const albumPath = albumPathOf(ref);
+  let buf: Buffer;
+  let label: string;
+  if (albumPath) {
+    const path = await completeAlbumPath(albumPath);
+    const res = await albumGet(path);
+    if (!res.ok) throw new Error(`Album photo ${path} not found (GitHub ${res.status}).`);
+    buf = Buffer.from(await res.arrayBuffer());
+    label = `album:${path}`;
+  } else {
+    if (!/^https?:\/\//i.test(ref)) {
+      throw new Error(`"${ref}" is neither a URL nor an album path (photos/YYYY-MM/<file>).`);
+    }
+    const res = await fetch(ref);
+    if (!res.ok) throw new Error(`Could not download ${ref}: HTTP ${res.status}`);
+    buf = Buffer.from(await res.arrayBuffer());
+    label = ref;
+  }
+  if (buf.length > 25 * 1024 * 1024) throw new Error(`${label} is larger than 25 MB.`);
+  const t = sniff(buf);
+  if (!t) throw new Error(`${label} is not a PNG/JPEG/WebP image.`);
+  if (t.mime === "image/gif") {
+    // The image model takes PNG/JPEG/WebP only: use the GIF's first frame.
+    const png = await sharp(buf, { pages: 1 }).png().toBuffer();
+    return { buf: png, mime: "image/png", ext: "png", label: `${label} (first frame)` };
+  }
+  return { buf, ...t, label };
+}
+
+/** Small JPEG thumbnail for inline previews (full PNGs are several MB). */
+async function thumbnail(buf: Buffer): Promise<string> {
+  const out = await sharp(buf, { pages: 1 })
+    .resize(512, 512, { fit: "inside", withoutEnlargement: true })
+    .flatten({ background: "#ffffff" })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  return out.toString("base64");
+}
+
 /**
  * Optional: also keep a copy of every image in a private GitHub repo (a photo album).
  * Enabled only when both env vars are set:
@@ -97,11 +220,9 @@ async function saveToGitHub(
     note?: string;
   },
 ): Promise<string> {
-  // Names are case-sensitive; accept the lowercase spellings too.
-  const token = process.env.GITHUB_TOKEN || process.env.github_token;
-  const repo = process.env.GITHUB_PHOTO_REPO || process.env.github_photo_repo;
-  if (!token || !repo) return "";
-  const branch = process.env.GITHUB_PHOTO_BRANCH || process.env.github_photo_branch || "main";
+  const cfg = albumConfig();
+  if (!cfg) return "";
+  const { token, repo, branch } = cfg;
   const api = async (method: string, path: string, body?: unknown) => {
     const res = await fetch(`https://api.github.com/repos/${repo}/${path}`, {
       method,
@@ -288,15 +409,27 @@ const handler = createMcpHandler((server) => {
 
   server.tool(
     "edit_image",
-    "Edit or extend an existing image, given by its public URL, following a text instruction. Hosts the result and " +
-      "returns a new public URL; the result is also saved to the user's GitHub photo album when the server has one " +
-      "configured. The server downloads the source, so the URL must be reachable without sign-in. Optionally supply a " +
-      "mask URL: a PNG with the same dimensions as the source whose transparent pixels mark the region to change; " +
-      "without a mask the whole image may be redrawn. Model, size and quality work as in generate_image.",
+    "Edit or extend an existing image following a text instruction. Hosts the result and returns a new public URL; " +
+      "the result is also saved to the user's GitHub photo album when the server has one configured. " +
+      "The source can be a public URL or a photo from the user's private album: give its album path " +
+      "(e.g. photos/2026-11/20261122-212839-hn42.png — find paths with list_album), its bare id, or its " +
+      "github.com / raw.githubusercontent.com link; the server reads the album with its own token. " +
+      "Add up to 15 more images in reference_images (same formats) to combine them or borrow a face, outfit, pet or " +
+      "style; say in the prompt which image is which (the source is image 1). Optionally supply a mask: a PNG with " +
+      "the same dimensions as the source whose transparent pixels mark the region to change; without a mask the " +
+      "whole image may be redrawn. Model, size and quality work as in generate_image.",
     {
-      image_url: z.string().url().describe("Public URL of the source image to edit."),
+      image_url: z
+        .string()
+        .min(1)
+        .describe("The source image: a public URL, or an album path / id / GitHub link of a photo in the album."),
       prompt: z.string().describe("What to change."),
-      mask_url: z.string().url().optional().describe("Public URL of an optional PNG mask."),
+      reference_images: z
+        .array(z.string().min(1))
+        .max(15)
+        .optional()
+        .describe("More images to use alongside the source (URLs or album paths), referred to as image 2, 3, …"),
+      mask_url: z.string().min(1).optional().describe("Optional PNG mask (URL or album path)."),
       size: z
         .enum(["1024x1024", "1024x1536", "1536x1024", "auto"])
         .optional()
@@ -314,21 +447,26 @@ const handler = createMcpHandler((server) => {
         .optional()
         .describe("Also return raw base64 PNG (for sandboxes that get a 403 fetching the URL)."),
     },
-    async ({ image_url, prompt, mask_url, size, quality, model, include_base64 }) => {
+    async ({ image_url, prompt, reference_images, mask_url, size, quality, model, include_base64 }) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
         const chosen = pickModel(model);
 
-        const imgBuf = Buffer.from(await (await fetch(image_url)).arrayBuffer());
+        const [sources, mask] = await Promise.all([
+          Promise.all([image_url, ...(reference_images ?? [])].map((r) => loadImage(r))),
+          mask_url ? loadImage(mask_url) : Promise.resolve(null),
+        ]);
+        if (mask && mask.mime !== "image/png") throw new Error("The mask must be a PNG.");
+
         const form = new FormData();
         form.append("model", chosen);
         form.append("prompt", prompt);
-        form.append("image", new Blob([imgBuf], { type: "image/png" }), "image.png");
-        if (mask_url) {
-          const maskBuf = Buffer.from(await (await fetch(mask_url)).arrayBuffer());
-          form.append("mask", new Blob([maskBuf], { type: "image/png" }), "mask.png");
-        }
+        const field = sources.length > 1 ? "image[]" : "image";
+        sources.forEach((s, i) => {
+          form.append(field, new Blob([new Uint8Array(s.buf)], { type: s.mime }), `image-${i + 1}.${s.ext}`);
+        });
+        if (mask) form.append("mask", new Blob([new Uint8Array(mask.buf)], { type: "image/png" }), "mask.png");
         if (size) form.append("size", size);
         if (quality) form.append("quality", quality);
 
@@ -342,7 +480,14 @@ const handler = createMcpHandler((server) => {
 
         const images = await extractImages(json);
         const urls = await hostImages(images, prompt);
-        const note = await saveToGitHub(images, { prompt, model: chosen, kind: "edit", urls, size });
+        const note = await saveToGitHub(images, {
+          prompt,
+          model: chosen,
+          kind: "edit",
+          urls,
+          size,
+          source: sources.map((s) => s.label).join(" + "),
+        });
         return ok(urls, images, chosen, !!include_base64, note);
       } catch (err) {
         return fail(err);
@@ -387,6 +532,134 @@ const handler = createMcpHandler((server) => {
         });
         if (!note2.startsWith("Saved")) throw new Error(note2 || "Save failed.");
         return { content: [{ type: "text" as const, text: note2 }] };
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.tool(
+    "list_album",
+    "List photos in the user's private GitHub photo album, newest first, with the album groups each belongs to " +
+      "and the start of the prompt that made it. Use it to find the path of a photo to pass to edit_image " +
+      "(image_url / reference_images). Filter by album name (e.g. 我們, 澄澄澎澎, Q版角色), month (YYYY-MM) or a " +
+      "keyword found in the prompt / caption. Set preview=true to also see small thumbnails of the first 4 listed photos.",
+    {
+      album: z.string().optional().describe("Album name to filter by. Omit to list everything."),
+      month: z
+        .string()
+        .regex(/^\d{4}-\d{2}$/)
+        .optional()
+        .describe("Only photos from this month, YYYY-MM."),
+      query: z.string().optional().describe("Keyword to look for in the prompt, caption, source or file name."),
+      limit: z.number().int().min(1).max(60).optional().describe("How many to return (default 20)."),
+      preview: z.boolean().optional().describe("Also return small thumbnails of the first 4 listed photos."),
+    },
+    async ({ album, month, query, limit, preview }) => {
+      try {
+        const cfg = albumConfig();
+        if (!cfg) throw new Error("The GitHub album is not configured on the server (GITHUB_TOKEN / GITHUB_PHOTO_REPO).");
+        const treeRes = await fetch(
+          `https://api.github.com/repos/${cfg.repo}/git/trees/${encodeURIComponent(cfg.branch)}?recursive=1`,
+          {
+            headers: {
+              Authorization: `Bearer ${cfg.token}`,
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+            },
+            cache: "no-store",
+          },
+        );
+        if (!treeRes.ok) throw new Error(`Could not read the album (GitHub ${treeRes.status}).`);
+        const tree = ((await treeRes.json()) as { tree: Array<{ path: string; type: string; size?: number }> }).tree;
+        const jsonPaths = new Set(tree.filter((t) => t.path.endsWith(".json")).map((t) => t.path));
+
+        // Which named albums hold which photos (albums.json is optional).
+        const groups = new Map<string, string[]>();
+        const albumNames: string[] = [];
+        const aRes = await albumGet("albums.json");
+        if (aRes.ok) {
+          const data = (await aRes.json().catch(() => ({}))) as { albums?: Array<{ name: string; photos?: string[] }> };
+          for (const a of data.albums ?? []) {
+            albumNames.push(a.name);
+            for (const p of a.photos ?? []) groups.set(p, [...(groups.get(p) ?? []), a.name]);
+          }
+        }
+
+        let items = tree
+          .filter((t) => t.type === "blob" && t.path.startsWith("photos/") && IMG_EXT.test(t.path))
+          .map((t) => ({ path: t.path, size: t.size ?? 0, albums: groups.get(t.path) ?? [] }))
+          .sort((a, b) => b.path.split("/").pop()!.localeCompare(a.path.split("/").pop()!));
+
+        if (album) {
+          const want = album.trim().toLowerCase();
+          items = items.filter((i) => i.albums.some((n) => n.toLowerCase() === want));
+          if (!items.length && !albumNames.some((n) => n.toLowerCase() === want)) {
+            throw new Error(`No album named "${album}". Albums: ${albumNames.join(", ") || "(none)"}.`);
+          }
+        }
+        if (month) items = items.filter((i) => i.path.startsWith(`photos/${month}/`));
+
+        const metaOf = async (path: string): Promise<Record<string, any> | null> => {
+          const jp = path.replace(IMG_EXT, ".json");
+          if (!jsonPaths.has(jp)) return null;
+          const r = await albumGet(jp);
+          return r.ok ? ((await r.json().catch(() => null)) as Record<string, any> | null) : null;
+        };
+        const fetchMeta = async (list: typeof items) => {
+          const out = new Map<string, Record<string, any> | null>();
+          for (let i = 0; i < list.length; i += 25) {
+            const chunk = list.slice(i, i + 25);
+            const metas = await Promise.all(chunk.map((it) => metaOf(it.path)));
+            chunk.forEach((it, j) => out.set(it.path, metas[j]));
+          }
+          return out;
+        };
+
+        const max = limit ?? 20;
+        let metas: Map<string, Record<string, any> | null>;
+        if (query) {
+          const q = query.trim().toLowerCase();
+          const pool = items.slice(0, 400);
+          metas = await fetchMeta(pool);
+          items = pool.filter((it) => {
+            const m = metas.get(it.path);
+            const hay = [it.path, m?.prompt, m?.note, m?.source, ...it.albums].filter(Boolean).join(" ").toLowerCase();
+            return hay.includes(q);
+          });
+        }
+        const total = items.length;
+        items = items.slice(0, max);
+        if (!query) metas = await fetchMeta(items);
+
+        const lines = items.map((it) => {
+          const m = metas!.get(it.path);
+          const bits = [it.path];
+          if (it.albums.length) bits.push(`[${it.albums.join(", ")}]`);
+          if (/\.gif$/i.test(it.path)) bits.push("(GIF — edit_image uses its first frame)");
+          const text = (m?.note || m?.prompt || m?.source || "").replace(/\s+/g, " ").trim();
+          if (text) bits.push(`— ${text.length > 140 ? `${text.slice(0, 140)}…` : text}`);
+          return bits.join(" ");
+        });
+        const head =
+          `${total} photo${total === 1 ? "" : "s"} found` +
+          (total > items.length ? `, showing the newest ${items.length}` : "") +
+          ". Pass a path to edit_image as image_url or in reference_images." +
+          (albumNames.length ? `\nAlbums: ${albumNames.join(", ")}` : "");
+
+        const content: Content[] = [{ type: "text", text: `${head}\n\n${lines.join("\n") || "(nothing)"}` }];
+        if (preview) {
+          const shown = items.slice(0, 4);
+          const thumbs = await Promise.all(
+            shown.map((i) => loadImage(i.path).then((img) => thumbnail(img.buf)).catch(() => null)),
+          );
+          thumbs.forEach((data, k) => {
+            if (!data) return;
+            content.push({ type: "text", text: shown[k].path });
+            content.push({ type: "image", data, mimeType: "image/jpeg" });
+          });
+        }
+        return { content };
       } catch (err) {
         return fail(err);
       }
